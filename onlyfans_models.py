@@ -1,0 +1,267 @@
+"""Small, read-only BabeWiki performer directory/profile scraper."""
+
+from __future__ import annotations
+
+import re
+import threading
+import time
+from urllib.parse import quote, urljoin, urlparse
+
+from bs4 import BeautifulSoup
+
+BASE_URL = "https://babewiki.com"
+GENDERS = {"Female", "Male", "Female,Male"}
+POPULARITY_SORT = "popularity"
+_CACHE_TTL = 300
+_cache = {}
+_cache_lock = threading.Lock()
+
+_PERSONAL_FIELDS = {
+    "Age": "age",
+    "Born": "birth_date",
+    "Gender": "gender",
+    "Career": "career",
+    "Country": "country",
+}
+_PHYSICAL_FIELDS = {
+    "Height": "height",
+    "Hair Color": "hair_color",
+    "Eye Color": "eye_color",
+    "Ethnicity": "ethnicity",
+    "Measurements": "measurements",
+    "Breast Type": "breast_type",
+    "Piercings": "piercings",
+}
+
+
+def _cached(key):
+    with _cache_lock:
+        row = _cache.get(key)
+        if row and row[0] > time.monotonic():
+            return row[1]
+        if row:
+            _cache.pop(key, None)
+    return None
+
+
+def _store(key, value):
+    with _cache_lock:
+        _cache[key] = (time.monotonic() + _CACHE_TTL, value)
+    return value
+
+
+def _fetch(url, http_get):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "babewiki.com":
+        raise ValueError("Refusing to fetch a non-BabeWiki URL")
+    response = http_get(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (compatible; VexoStreamModels/1.0; "
+                "+https://babewiki.com/)"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.8",
+        },
+        timeout=12,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _flag_to_country_code(flag):
+    points = [ord(ch) for ch in (flag or "") if 0x1F1E6 <= ord(ch) <= 0x1F1FF]
+    if len(points) == 2:
+        return "".join(chr(point - 0x1F1E6 + ord("A")) for point in points)
+    return ""
+
+
+def _absolute_image(src):
+    if not src:
+        return ""
+    absolute = urljoin(BASE_URL + "/", src.strip())
+    parsed = urlparse(absolute)
+    return absolute if parsed.scheme == "https" and parsed.hostname == "babewiki.com" else ""
+
+
+def _page_url(gender, page):
+    return (
+        f"{BASE_URL}/performers?gender={quote(gender, safe='')}"
+        f"&sort={POPULARITY_SORT}&page={page}"
+    )
+
+
+def _parse_listing(html, gender, page):
+    soup = BeautifulSoup(html, "html.parser")
+    models = []
+    seen = set()
+    for anchor in soup.select('a[href^="/performer/"]'):
+        href = (anchor.get("href") or "").strip()
+        match = re.fullmatch(r"/performer/([a-zA-Z0-9][a-zA-Z0-9-]{0,119})/?", href)
+        if not match:
+            continue
+        slug = match.group(1)
+        if slug in seen:
+            continue
+        image = anchor.find("img")
+        spans = anchor.select("span.truncate")
+        name = spans[0].get_text(" ", strip=True) if spans else ""
+        if not name and image:
+            name = re.sub(r"'s BabeWiki Profile$", "", image.get("alt", "")).strip()
+        if not name:
+            continue
+        flag = ""
+        flag_node = anchor.select_one("span.text-sm.leading-none")
+        if flag_node:
+            flag = flag_node.get_text("", strip=True)
+        country_name = spans[1].get_text(" ", strip=True) if len(spans) > 1 else ""
+        seen.add(slug)
+        models.append(
+            {
+                "name": name,
+                "slug": slug,
+                "profile_url": f"{BASE_URL}/performer/{slug}",
+                "image_url": _absolute_image(image.get("src") if image else ""),
+                "country_code": _flag_to_country_code(flag),
+                "country_flag": flag,
+                "country_name": country_name,
+                "gender": gender if gender != "Female,Male" else "",
+            }
+        )
+    next_page = False
+    for link in soup.select('a[href*="page="], button[aria-label*="Next"], button[title*="Next"]'):
+        label = " ".join(
+            [
+                link.get_text(" ", strip=True),
+                link.get("aria-label", ""),
+                link.get("title", ""),
+            ]
+        ).lower()
+        link_url = urljoin(BASE_URL, link.get("href", ""))
+        if "next" in label or re.search(r"[?&]page=(\d+)", link_url):
+            page_match = re.search(r"[?&]page=(\d+)", link_url)
+            if "next" in label or (page_match and int(page_match.group(1)) > page):
+                next_page = True
+                break
+    return models, next_page
+
+
+def scrape_listing(gender, page, http_get):
+    if gender not in GENDERS:
+        raise ValueError("gender must be Female, Male, or Female,Male")
+    page = max(1, min(int(page or 1), 500))
+    key = ("listing", gender, page)
+    cached = _cached(key)
+    if cached is not None:
+        return cached
+    html = _fetch(_page_url(gender, page), http_get)
+    models, has_more = _parse_listing(html, gender, page)
+    return _store(
+        key,
+        {
+            "models": models,
+            "gender": gender,
+            "sort": POPULARITY_SORT,
+            "page": page,
+            "has_more": has_more or len(models) >= 40,
+        },
+    )
+
+
+def _clean_lines(soup):
+    return [
+        re.sub(r"\s+", " ", line).strip()
+        for line in soup.get_text("\n", strip=True).splitlines()
+        if re.sub(r"\s+", " ", line).strip()
+    ]
+
+
+def _field_values(lines, fields):
+    labels = {label.lower(): key for label, key in fields.items()}
+    result = {}
+    for index, line in enumerate(lines):
+        clean = line.strip().rstrip(":").strip()
+        key = labels.get(clean.lower())
+        if not key:
+            continue
+        value = ""
+        if ":" in line and line.split(":", 1)[0].strip().lower() in labels:
+            value = line.split(":", 1)[1].strip()
+        elif index + 1 < len(lines):
+            value = lines[index + 1].strip()
+        if value:
+            result[key] = value
+    age = result.get("age", "")
+    born_match = re.search(r"\bBorn:\s*(.+)$", age, re.IGNORECASE)
+    if born_match:
+        result["birth_date"] = born_match.group(1).strip()
+        result["age"] = age[: born_match.start()].strip()
+    return result
+
+
+def _profile_sections(soup):
+    lines = _clean_lines(soup)
+    personal_start = next(
+        (i for i, line in enumerate(lines) if line.lower() == "personal details"),
+        -1,
+    )
+    physical_start = next(
+        (i for i, line in enumerate(lines) if line.lower() == "physical attributes"),
+        -1,
+    )
+    if personal_start >= 0:
+        personal_lines = lines[personal_start + 1 : physical_start if physical_start > personal_start else len(lines)]
+    else:
+        personal_lines = lines
+    physical_lines = lines[physical_start + 1 :] if physical_start >= 0 else lines
+
+    personal = _field_values(personal_lines, _PERSONAL_FIELDS)
+    physical = _field_values(physical_lines, _PHYSICAL_FIELDS)
+
+    # Some profile layouts split "Born" out of the Age value into its own row.
+    if "birth_date" not in personal:
+        for line in personal_lines:
+            born_match = re.match(r"Born:\s*(.+)$", line, re.IGNORECASE)
+            if born_match:
+                personal["birth_date"] = born_match.group(1).strip()
+                break
+    return personal, physical
+
+
+def scrape_profile(slug, http_get):
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9-]{0,119}", slug or ""):
+        raise ValueError("Invalid performer slug")
+    key = ("profile", slug.lower())
+    cached = _cached(key)
+    if cached is not None:
+        return cached
+    html = _fetch(f"{BASE_URL}/performer/{slug}", http_get)
+    soup = BeautifulSoup(html, "html.parser")
+    heading = soup.find("h1")
+    name = heading.get_text(" ", strip=True) if heading else ""
+    if not name:
+        title = soup.find("title")
+        name = title.get_text(" ", strip=True).split(" Wiki", 1)[0] if title else ""
+    if not name:
+        return None
+    image = soup.select_one('img[alt*="BabeWiki Profile"], img[src*="/images/"]')
+    flag_node = soup.select_one("span.text-sm.leading-none")
+    flag = flag_node.get_text("", strip=True) if flag_node else ""
+    personal, physical = _profile_sections(soup)
+    if flag and not personal.get("country"):
+        # The country text is usually the next truncated span beside the flag.
+        country_node = flag_node.find_next("span", class_="truncate")
+        if country_node:
+            personal["country"] = country_node.get_text(" ", strip=True)
+    result = {
+        "name": name,
+        "slug": slug,
+        "profile_url": f"{BASE_URL}/performer/{slug}",
+        "image_url": _absolute_image(image.get("src") if image else ""),
+        "country_flag": flag,
+        "country_code": _flag_to_country_code(flag),
+        "personal_details": personal,
+        "physical_attributes": physical,
+    }
+    return _store(key, result)
