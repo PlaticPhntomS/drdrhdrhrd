@@ -95,7 +95,7 @@ _PROXIES = {"http": EGRESS, "https": EGRESS} if EGRESS else None
 
 
 @main.app.get("/api/models")
-async def onlyfans_models(gender: str = "Female", sort: str = "popularity", page: int = 1):
+async def onlyfans_models(gender: str = "Female", sort: str = "popularity", page: int = 1, search: str = "", q: str = ""):
     """Return BabeWiki profiles from the selected popularity-sorted gender list."""
     if gender not in GENDERS:
         raise HTTPException(status_code=400, detail="gender must be Female, Male, or Female,Male")
@@ -105,7 +105,7 @@ async def onlyfans_models(gender: str = "Female", sort: str = "popularity", page
     loop = asyncio.get_running_loop()
     try:
         data = await loop.run_in_executor(
-            main.thread_pool, scrape_listing, gender, page, main.requests.get
+            main.thread_pool, scrape_listing, gender, page, main.requests.get, (search or q)
         )
         return data
     except Exception as exc:
@@ -475,7 +475,12 @@ async def proxy_image(url: str):
         target = "https:" + target
     if not _safe_url(target):
         return _bad_url()
-    up = await _open(target, main.get_dynamic_headers(target), 12.0, stream=False)
+    headers = main.get_dynamic_headers(target)
+    if "babewiki" in (urlparse(target).hostname or "").lower():
+        headers["Referer"] = "https://babewiki.com/"
+        headers["Origin"] = "https://babewiki.com"
+        headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    up = await _open(target, headers, 12.0, stream=False)
     if up.aiter is None:
         return Response(status_code=404, headers=CORS)
     return Response(content=await _read(up), headers={

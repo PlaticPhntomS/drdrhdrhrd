@@ -9,8 +9,8 @@ All Cloudflare Workers, GitHub Actions relays, decoy pages, and frontend web UIs
 
 - `GET /` — API health check (`{"status": "Online", "engine": "Fast Edge Extraction Engine"}`)
 - `GET /api/explore?q=...&page=...&provider=...` — Search & explore provider catalogue
-- `GET /api/models?gender=Female&sort=popularity&page=1` — Popular BabeWiki performer listings; `gender` accepts `Female`, `Male`, or `Female,Male`
-- `GET /api/models/{slug}` — Public performer profile details and image URL
+- `GET /api/models?gender=Female&sort=popularity&page=1&search=abella` — Popular BabeWiki performer listings; `gender` accepts `Female`, `Male`, or `Female,Male`; `search` is optional
+- `GET /api/models/{slug}` — Performer profile details plus every gallery photo (`images` array, in order)
 - `GET /api/extract?url=...` — Video stream extraction via yt-dlp & TLS rotation
 - `GET /api/providers` — List supported content providers
 - `GET /proxy-m3u8?url=...` — Rewritten HLS stream proxy

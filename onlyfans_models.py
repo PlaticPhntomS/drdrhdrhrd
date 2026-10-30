@@ -85,11 +85,27 @@ def _absolute_image(src):
     return absolute if parsed.scheme == "https" and parsed.hostname == "babewiki.com" else ""
 
 
-def _page_url(gender, page):
-    return (
+_FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]")
+
+
+def _strip_flags(text):
+    """Remove regional-indicator flag emoji so country text never shows the flag twice."""
+    return re.sub(r"\s+", " ", _FLAG_RE.sub("", text or "")).strip()
+
+
+def clean_search(search):
+    search = re.sub(r"\s+", " ", (search or "")).strip()
+    return search[:80]
+
+
+def _page_url(gender, page, search=""):
+    url = (
         f"{BASE_URL}/performers?gender={quote(gender, safe='')}"
         f"&sort={POPULARITY_SORT}&page={page}"
     )
+    if search:
+        url += f"&search={quote(search, safe='')}"
+    return url
 
 
 def _parse_listing(html, gender, page):
@@ -115,7 +131,7 @@ def _parse_listing(html, gender, page):
         flag_node = anchor.select_one("span.text-sm.leading-none")
         if flag_node:
             flag = flag_node.get_text("", strip=True)
-        country_name = spans[1].get_text(" ", strip=True) if len(spans) > 1 else ""
+        country_name = _strip_flags(spans[1].get_text(" ", strip=True)) if len(spans) > 1 else ""
         seen.add(slug)
         models.append(
             {
@@ -147,15 +163,16 @@ def _parse_listing(html, gender, page):
     return models, next_page
 
 
-def scrape_listing(gender, page, http_get):
+def scrape_listing(gender, page, http_get, search=""):
     if gender not in GENDERS:
         raise ValueError("gender must be Female, Male, or Female,Male")
     page = max(1, min(int(page or 1), 500))
-    key = ("listing", gender, page)
+    search = clean_search(search)
+    key = ("listing", gender, page, search.lower())
     cached = _cached(key)
     if cached is not None:
         return cached
-    html = _fetch(_page_url(gender, page), http_get)
+    html = _fetch(_page_url(gender, page, search), http_get)
     models, has_more = _parse_listing(html, gender, page)
     return _store(
         key,
@@ -163,6 +180,7 @@ def scrape_listing(gender, page, http_get):
             "models": models,
             "gender": gender,
             "sort": POPULARITY_SORT,
+            "search": search,
             "page": page,
             "has_more": has_more or len(models) >= 40,
         },
@@ -229,6 +247,35 @@ def _profile_sections(soup):
     return personal, physical
 
 
+def _gallery_images(soup, slug, main_image=""):
+    """Every photo in the profile carousel, in photo order, without loop clones."""
+    numbered = {}
+    for img in soup.find_all("img"):
+        alt = img.get("alt") or ""
+        match = re.search(r"'s photo (\d+)\s*$", alt, re.IGNORECASE)
+        if not match:
+            continue
+        src = _absolute_image(img.get("src") or img.get("data-src") or "")
+        if src:
+            numbered.setdefault(int(match.group(1)), src)
+    images = [numbered[n] for n in sorted(numbered)]
+    if not images:
+        # Fallback: any image file named after this performer.
+        prefix = "/images/" + slug.lower().replace("-", "_") + "_"
+        for img in soup.find_all("img"):
+            src = _absolute_image(img.get("src") or "")
+            if src and prefix in src.lower():
+                images.append(src)
+    if main_image:
+        images.insert(0, main_image)
+    out, seen = [], set()
+    for src in images:
+        if src not in seen:
+            seen.add(src)
+            out.append(src)
+    return out
+
+
 def scrape_profile(slug, http_get):
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9-]{0,119}", slug or ""):
         raise ValueError("Invalid performer slug")
@@ -245,7 +292,7 @@ def scrape_profile(slug, http_get):
         name = title.get_text(" ", strip=True).split(" Wiki", 1)[0] if title else ""
     if not name:
         return None
-    image = soup.select_one('img[alt*="BabeWiki Profile"], img[src*="/images/"]')
+    image = soup.select_one('img[alt$="\'s photo 1"]') or soup.select_one('img[alt*="BabeWiki Profile"], img[src*="/images/"]')
     flag_node = soup.select_one("span.text-sm.leading-none")
     flag = flag_node.get_text("", strip=True) if flag_node else ""
     personal, physical = _profile_sections(soup)
@@ -254,13 +301,19 @@ def scrape_profile(slug, http_get):
         country_node = flag_node.find_next("span", class_="truncate")
         if country_node:
             personal["country"] = country_node.get_text(" ", strip=True)
+    personal = {k: _strip_flags(v) for k, v in personal.items() if _strip_flags(v)}
+    physical = {k: _strip_flags(v) for k, v in physical.items() if _strip_flags(v)}
+    main_image = _absolute_image(image.get("src") if image else "")
+    images = _gallery_images(soup, slug, main_image)
     result = {
         "name": name,
         "slug": slug,
         "profile_url": f"{BASE_URL}/performer/{slug}",
-        "image_url": _absolute_image(image.get("src") if image else ""),
+        "image_url": images[0] if images else main_image,
+        "images": images,
         "country_flag": flag,
         "country_code": _flag_to_country_code(flag),
+        "country_name": personal.get("country", ""),
         "personal_details": personal,
         "physical_attributes": physical,
     }
