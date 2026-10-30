@@ -82,7 +82,49 @@ def _absolute_image(src):
         return ""
     absolute = urljoin(BASE_URL + "/", src.strip())
     parsed = urlparse(absolute)
-    return absolute if parsed.scheme == "https" and parsed.hostname == "babewiki.com" else ""
+    host = (parsed.hostname or "").lower()
+    trusted_host = host == "babewiki.com" or host.endswith(".babewiki.com")
+    return absolute if parsed.scheme == "https" and trusted_host else ""
+
+
+def _srcset_image(srcset):
+    """Pick the largest usable image candidate from a srcset attribute."""
+    candidates = []
+    for item in (srcset or "").split(","):
+        parts = item.strip().split()
+        if not parts:
+            continue
+        score = 1.0
+        if len(parts) > 1:
+            match = re.fullmatch(r"(\d+(?:\.\d+)?)(w|x)", parts[-1].lower())
+            if match:
+                score = float(match.group(1))
+                if match.group(2) == "x":
+                    score *= 10000
+        candidates.append((score, parts[0]))
+    for _, src in sorted(candidates, reverse=True):
+        absolute = _absolute_image(src)
+        if absolute:
+            return absolute
+    return ""
+
+
+def _image_url(img):
+    """Resolve an image across common lazy-loading and responsive-image markup."""
+    if img is None:
+        return ""
+    for attr in ("data-original", "data-lazy-src", "data-src", "data-srcset", "srcset"):
+        value = img.get(attr)
+        image = _srcset_image(value) if attr.endswith("srcset") else _absolute_image(value)
+        if image:
+            return image
+    picture = img.find_parent("picture")
+    if picture:
+        for source in picture.find_all("source"):
+            image = _srcset_image(source.get("data-srcset") or source.get("srcset"))
+            if image:
+                return image
+    return _absolute_image(img.get("src"))
 
 
 _FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]")
@@ -138,7 +180,7 @@ def _parse_listing(html, gender, page):
                 "name": name,
                 "slug": slug,
                 "profile_url": f"{BASE_URL}/performer/{slug}",
-                "image_url": _absolute_image(image.get("src") if image else ""),
+                "image_url": _image_url(image),
                 "country_code": _flag_to_country_code(flag),
                 "country_flag": flag,
                 "country_name": country_name,
@@ -255,7 +297,7 @@ def _gallery_images(soup, slug, main_image=""):
         match = re.search(r"'s photo (\d+)\s*$", alt, re.IGNORECASE)
         if not match:
             continue
-        src = _absolute_image(img.get("src") or img.get("data-src") or "")
+        src = _image_url(img)
         if src:
             numbered.setdefault(int(match.group(1)), src)
     images = [numbered[n] for n in sorted(numbered)]
@@ -263,8 +305,8 @@ def _gallery_images(soup, slug, main_image=""):
         # Fallback: any image file named after this performer.
         prefix = "/images/" + slug.lower().replace("-", "_") + "_"
         for img in soup.find_all("img"):
-            src = _absolute_image(img.get("src") or "")
-            if src and prefix in src.lower():
+            src = _image_url(img)
+            if src and prefix in urlparse(src).path.lower():
                 images.append(src)
     if main_image:
         images.insert(0, main_image)
@@ -303,7 +345,12 @@ def scrape_profile(slug, http_get):
             personal["country"] = country_node.get_text(" ", strip=True)
     personal = {k: _strip_flags(v) for k, v in personal.items() if _strip_flags(v)}
     physical = {k: _strip_flags(v) for k, v in physical.items() if _strip_flags(v)}
-    main_image = _absolute_image(image.get("src") if image else "")
+    main_image = _image_url(image)
+    if not main_image:
+        for meta in soup.select('meta[property="og:image"], meta[name="twitter:image"]'):
+            main_image = _absolute_image(meta.get("content"))
+            if main_image:
+                break
     images = _gallery_images(soup, slug, main_image)
     result = {
         "name": name,
